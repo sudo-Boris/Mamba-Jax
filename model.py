@@ -25,7 +25,11 @@ Glossary:
 from __future__ import annotations
 import math
 import json
+from typing import Union
 
+from transformers import AutoTokenizer
+import torch
+import torch.nn.functional as F
 import jax
 import jax.numpy as jnp
 import flax
@@ -34,7 +38,7 @@ import flax.linen as nn
 from dataclasses import dataclass
 from einops import rearrange, repeat, einsum
 
-from typing import Union
+from model_pytorch import Mamba as MambaPytorch
 
 
 @dataclass
@@ -89,6 +93,10 @@ class Mamba(nn.Module):
             logits: shape (b, l, vocab_size)
         """
 
+        # Ensure input_ids is a batch
+        if input_ids.ndim == 1:
+            input_ids = jnp.expand_dims(input_ids, axis=0)
+
         x = self.embedding.encode(input_ids)
 
         for i, layer in enumerate(self.layers):
@@ -114,13 +122,21 @@ class Embedder(nn.Module):
             (self.vocab_size, self.embed_dim),
         )
 
-    def encode(self, x: jax.Array) -> jax.Array:
+    def _encode(self, x: jax.Array) -> jax.Array:
         x = self.input_embedding_table[(x,)]
         # x *= jnp.sqrt(self.embed_dim).astype(x.dtype)
         return x
 
-    def decode(self, x: jax.Array) -> jax.Array:
+    def encode(self, x: jax.Array) -> jax.Array:
+        encode = jax.vmap(self._encode, in_axes=(0))
+        return encode(x)
+
+    def _decode(self, x: jax.Array) -> jax.Array:
         return jnp.dot(x, self.input_embedding_table.T)
+
+    def decode(self, x: jax.Array) -> jax.Array:
+        decode = jax.vmap(self._decode, in_axes=(0))
+        return decode(x)
 
 
 class ResidualBlock(nn.Module):
@@ -296,3 +312,73 @@ class RMSNorm(nn.Module):
         self.weight = self.param(
             "weight", lambda rng, shape: jnp.ones(shape), (self.d_model,)
         )
+
+
+def load_model_from_pytorch(
+    pretrained_model_name: str = "state-spaces/mamba-370m",
+    tokenizer: str = "EleutherAI/gpt-neox-20b",
+):
+    """Load a pretrained model from HuggingFace and convert it to a Flax model.
+
+    Args:
+        pretrained_model_name (str): The name of the model to load. One of:
+            'state-spaces/mamba-2.8b-slimpj'
+            'state-spaces/mamba-2.8b'
+            'state-spaces/mamba-1.4b'
+            'state-spaces/mamba-790m'
+            'state-spaces/mamba-370m'
+            'state-spaces/mamba-130m'
+        tokenizer (str): The name of the tokenizer to use. One of:
+            'EleutherAI/gpt-neox-20b'
+
+    Returns:
+        model: The flax model
+        weights: The pretrained weights for the model
+        tokenizer: The tokenizer to use with the model
+    """
+    modelPytorch = MambaPytorch.from_pretrained(pretrained_model_name)
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+
+    modelArgsJax = ModelArgs(
+        d_model=modelPytorch.args.d_model,
+        n_layer=modelPytorch.args.n_layer,
+        vocab_size=modelPytorch.args.vocab_size,
+    )
+
+    modelJax = Mamba(modelArgsJax)
+
+    from params import pytorch_to_jax_weights
+
+    weights = pytorch_to_jax_weights(modelPytorch.state_dict())
+
+    return modelJax, weights, tokenizer
+
+
+def get_mamba_model(
+    finetune: bool = None,
+    model_config: ModelArgs = None,
+    b: int = 1,
+    t: int = 128,
+    rng: jax.random.PRNGKey = None,
+):
+
+    assert rng is not None, "Must provide a random key for initialization."
+
+    if finetune is not None:
+        model, params, tokenizer = load_model_from_pytorch()
+    else:
+        # Initialize model
+        modelArgsJax = ModelArgs(
+            d_model=1024,
+            n_layer=48,
+            vocab_size=50280,
+        )
+        model = Mamba(modelArgsJax)
+
+        # Initialize parameters
+        param_key, dropout_key = jax.random.split(rng, 2)
+        model_rng = {"params": param_key, "dropout": dropout_key}
+        example_input = jnp.ones((b, t), jnp.int32)
+        params = model.init(model_rng, example_input)["params"]
+
+    return model, params
